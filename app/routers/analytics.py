@@ -1,4 +1,8 @@
-"""Analytics endpoints: monthly summary and category breakdown."""
+"""Analytics endpoints: monthly summary and category breakdown.
+
+Receipts are bucketed by the date printed on the document (receipt_date) and
+fall back to the upload date when no date could be read.
+"""
 
 import calendar
 from datetime import date
@@ -13,6 +17,13 @@ from app.models import Receipt
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
+# The date a receipt counts toward: printed date if we have one, else upload date.
+effective_date = func.coalesce(Receipt.receipt_date, func.date(Receipt.created_at))
+
+
+def _in_month(month: int, year: int):
+    return (extract("month", effective_date) == month, extract("year", effective_date) == year)
+
 
 @router.get("/monthly", response_model=schemas.MonthlySummary)
 def monthly_summary(
@@ -21,66 +32,42 @@ def monthly_summary(
     db: Session = Depends(get_db),
 ):
     """
-    Args:
-        month: Target month number (1-12), defaults to current month.
-        year: Target four-digit year, defaults to current year.
-        db: SQLAlchemy database session.
-    Return:
-        MonthlySummary with total spend, receipt count, average, previous month total, and daily breakdown.
-    Calculates monthly spending totals and day-by-day expenditure for charting.
+    Spending summary for a month across all receipts (defaults to the current month),
+    with a daily breakdown for charting.
     """
     today = date.today()
     month = month or today.month
     year = year or today.year
 
-    month_filter = (
-        extract("month", Receipt.created_at) == month,
-        extract("year", Receipt.created_at) == year,
+    total_spent = (
+        db.query(func.coalesce(func.sum(Receipt.total), 0.0)).filter(*_in_month(month, year)).scalar()
+    )
+    receipt_count = db.query(func.count(Receipt.id)).filter(*_in_month(month, year)).scalar()
+    avg_per_receipt = round(total_spent / receipt_count, 2) if receipt_count else 0.0
+
+    prev_month, prev_year = (12, year - 1) if month == 1 else (month - 1, year)
+    previous_month_total = (
+        db.query(func.coalesce(func.sum(Receipt.total), 0.0))
+        .filter(*_in_month(prev_month, prev_year))
+        .scalar()
     )
 
-    total_spent = db.query(
-        func.coalesce(func.sum(Receipt.total), 0.0)
-    ).filter(*month_filter).scalar()
-
-    receipt_count = db.query(Receipt).filter(*month_filter).count()
-    avg_per_receipt = round(total_spent / receipt_count, 2) if receipt_count > 0 else 0.0
-
-    if month == 1:
-        prev_month, prev_year = 12, year - 1
-    else:
-        prev_month, prev_year = month - 1, year
-
-    previous_month_total = db.query(
-        func.coalesce(func.sum(Receipt.total), 0.0)
-    ).filter(
-        extract("month", Receipt.created_at) == prev_month,
-        extract("year", Receipt.created_at) == prev_year,
-    ).scalar()
-
-    days_in_month = calendar.monthrange(year, month)[1]
     daily_rows = (
-        db.query(
-            func.date(Receipt.created_at).label("day"),
-            func.sum(Receipt.total).label("total"),
-        )
-        .filter(*month_filter)
-        .group_by(func.date(Receipt.created_at))
-        .order_by(func.date(Receipt.created_at))
+        db.query(effective_date.label("day"), func.sum(Receipt.total).label("total"))
+        .filter(*_in_month(month, year))
+        .group_by(effective_date)
+        .order_by(effective_date)
         .all()
     )
-
     daily_map = {str(row.day): float(row.total) for row in daily_rows}
+
+    days_in_month = calendar.monthrange(year, month)[1]
     daily_breakdown = []
     for day_num in range(1, days_in_month + 1):
         d = date(year, month, day_num)
         if d > today:
-            break
-        daily_breakdown.append(
-            schemas.DailySpend(
-                date=str(d),
-                total=daily_map.get(str(d), 0.0),
-            )
-        )
+            break  # no future days
+        daily_breakdown.append(schemas.DailySpend(date=str(d), total=daily_map.get(str(d), 0.0)))
 
     return schemas.MonthlySummary(
         month=month,
@@ -99,15 +86,7 @@ def category_breakdown(
     year: int = Query(None, ge=2020, le=2100),
     db: Session = Depends(get_db),
 ):
-    """
-    Args:
-        month: Target month number (1-12), defaults to current month.
-        year: Target four-digit year, defaults to current year.
-        db: SQLAlchemy database session.
-    Return:
-        List of CategoryBreakdownItem objects ordered by highest spend.
-    Groups monthly spending by category with totals, percentages, and receipt counts.
-    """
+    """Spending by category for a month: total, share of overall spend, receipt count."""
     today = date.today()
     month = month or today.month
     year = year or today.year
@@ -118,16 +97,13 @@ def category_breakdown(
             func.sum(Receipt.total).label("total"),
             func.count(Receipt.id).label("count"),
         )
-        .filter(
-            extract("month", Receipt.created_at) == month,
-            extract("year", Receipt.created_at) == year,
-        )
+        .filter(*_in_month(month, year))
         .group_by(Receipt.category)
         .order_by(func.sum(Receipt.total).desc())
         .all()
     )
 
-    grand_total = sum(float(r.total) for r in rows) or 1.0
+    grand_total = sum(float(r.total) for r in rows) or 1.0  # avoid division by zero
 
     return [
         schemas.CategoryBreakdownItem(

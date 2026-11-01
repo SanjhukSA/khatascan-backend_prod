@@ -21,11 +21,12 @@ dependencies = [
     # ── OCR / AI ─────────────────────────────────────────────────
     "google-genai>=1.0.0",
     "pillow==10.3.0",
-    "tenacity>=8.0",
+    "tenacity>=8.2",
     "pydantic==2.7.4",
     "python-dotenv==1.0.1",
     "psycopg-binary==3.3.6",
     "rapidocr-onnxruntime>=1.4.4",
+    "alembic>=1.13",
 ]
 
 [build-system]
