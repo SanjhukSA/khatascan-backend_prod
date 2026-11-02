@@ -57,6 +57,17 @@ def merge_pages(pages: List[dict], today: Optional[date] = None) -> dict:
         order.sort(key=lambda i: nums[i])
     ordered = [pages[i] for i in order]
 
+    if not numbered:
+        seen = {}
+        for pos, p in enumerate(ordered, start=1):
+            sig = " ".join(str(p.get("raw_text") or "").split()).lower() or (
+                tuple((i["name"], i["total_price"]) for i in p["items"]), p.get("total")
+            ) if (p.get("raw_text") or p["items"]) else None
+            if sig is not None and sig in seen:
+                raise MergeError(f"Pages {seen[sig]} and {pos} look identical. Was one uploaded twice?")
+            if sig is not None:
+                seen[sig] = pos
+
     invoice_numbers = {p["invoice_number"] for p in ordered if p.get("invoice_number")}
     gstins = {p["vendor_gstin"] for p in ordered if p.get("vendor_gstin")}
     if len(invoice_numbers) > 1 or len(gstins) > 1:
@@ -92,7 +103,14 @@ def merge_pages(pages: List[dict], today: Optional[date] = None) -> dict:
     )
 
     if last_is_final and last.get("has_total"):
-        total, tax_total, discount_total = last["total"], last["tax_total"], last["discount_total"]
+        total = last["total"]
+        # normalize() fills a missing tax/discount total from *that page's* items only.
+        # Keep the last page's figure only if it was really printed (more than its own items
+        # explain); otherwise pass 0 so normalize sums every page's items.
+        last_tax = round(sum(i["tax_amount"] for i in last["items"]), 2)
+        last_disc = round(sum(i["discount"] for i in last["items"]), 2)
+        tax_total = last["tax_total"] if last["tax_total"] > last_tax + 0.01 else 0
+        discount_total = last["discount_total"] if last["discount_total"] > last_disc + 0.01 else 0
     elif last_is_final:
         total, tax_total, discount_total = 0, 0, 0     # normalize will compute it and flag it
     else:
@@ -105,9 +123,18 @@ def merge_pages(pages: List[dict], today: Optional[date] = None) -> dict:
     date_page = next((p for p in ordered if p.get("date")), ordered[0])
     best_level = min((p.get("legibility", "medium") for p in ordered), key=_LEVELS.index)
 
+    types = [p.get("document_type") or "other" for p in ordered]
+    good = [t for t in types if t not in REJECT_TYPES]
+    if good:
+        doc_type = good[0]
+    elif len(set(types)) == 1:
+        doc_type = types[0]                                # every page agrees (e.g. all menu)
+    else:                                                  # mixed labels: let a human decide
+        doc_type = "invoice" if (item_sum > 0 or last.get("has_total")) else "other"
+
     merged = normalize_extraction(
         {
-            "document_type": _first(ordered, "document_type", empty=(None, "", "other")) or "other",
+            "document_type": doc_type,
             "engine": last.get("engine"),
             "vendor_name": _first(ordered, "vendor_name", empty=(None, "", "Unknown Vendor")),
             "vendor_gstin": _first(ordered, "vendor_gstin"),

@@ -1,5 +1,6 @@
 """Pydantic schemas for request validation and response serialization."""
 
+import re
 import datetime as dt   # `import datetime as dt` because a field below is literally named `date`
 from typing import List, Optional
 from uuid import UUID
@@ -7,9 +8,11 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.normalize import (
+    GSTIN_RE,
     normalize_category,
+    normalize_currency,
     normalize_doc_type,
-    normalize_gstin,
+    normalize_level,
 )
 
 
@@ -64,7 +67,28 @@ class _ReceiptFieldCleaning(BaseModel):
     @field_validator("vendor_gstin", check_fields=False)
     @classmethod
     def _gstin(cls, v):
-        return normalize_gstin(v)
+        """Empty/null clears it; a typo is an error (never silently erase the stored value)."""
+        g = re.sub(r"\s+", "", v or "").upper()
+        if not g:
+            return None
+        if not GSTIN_RE.match(g):
+            raise ValueError("Invalid GSTIN: expected 15 characters like 27AAPFU0939F1ZV")
+        return g
+
+    @field_validator("vendor_name", check_fields=False)
+    @classmethod
+    def _vendor_name(cls, v):
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("vendor_name cannot be blank")
+        return v
+
+    @field_validator("confidence", check_fields=False)
+    @classmethod
+    def _confidence(cls, v):
+        return None if v is None else normalize_level(v)
 
     @field_validator("invoice_number", check_fields=False)
     @classmethod
@@ -75,10 +99,7 @@ class _ReceiptFieldCleaning(BaseModel):
     @field_validator("currency", check_fields=False)
     @classmethod
     def _currency(cls, v):
-        if v is None:
-            return None
-        v = v.strip().upper()
-        return v if len(v) == 3 else "INR"
+        return None if v is None else normalize_currency(v)
 
 
 MAX_PAGES = 20
@@ -231,6 +252,7 @@ class DailySpend(BaseModel):
 
 
 class MonthlySummary(BaseModel):
+    currency: str = "INR"
     month: int
     year: int
     total_spent: float

@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     auto_create_tables: bool = False
 
     # ── File uploads ─────────────────────────────────────────────────
+    # Timezone used for "today" and for bucketing receipts that have no printed date.
+    app_timezone: str = "Asia/Kolkata"
+
     upload_dir: str = "uploads"
     max_upload_bytes: int = 10 * 1024 * 1024  # 10 MB
     # Uploads that were never saved as a receipt are deleted after this long.

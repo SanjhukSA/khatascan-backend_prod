@@ -98,7 +98,13 @@ def preprocess_image(image_bytes: bytes) -> Image.Image:
     """
     image = Image.open(io.BytesIO(image_bytes))
     image = ImageOps.exif_transpose(image)   # fixes phone photos that carry EXIF
-    image = image.convert("RGB")
+    if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+        rgba = image.convert("RGBA")         # flatten onto white: transparent → black ruins OCR
+        flat = Image.new("RGB", rgba.size, (255, 255, 255))
+        flat.paste(rgba, mask=rgba.split()[3])
+        image = flat
+    else:
+        image = image.convert("RGB")
 
     w, h = image.size
     if max(w, h) > _MAX_IMAGE_DIM:
@@ -137,7 +143,11 @@ def save_upload(image_bytes: bytes, upload_dir: str) -> tuple[str, str, str]:
 def _is_retryable(exc: BaseException) -> bool:
     """Retry on 503 (overloaded) and 429 (rate limited) Gemini API errors."""
     msg = str(exc)
-    return "503" in msg or "429" in msg or "UNAVAILABLE" in msg or "RESOURCE_EXHAUSTED" in msg
+    if re.search(r"per[\s_-]*day|daily", msg, re.IGNORECASE):
+        return False                       # daily quota: waiting a few seconds won't fix it
+    if getattr(exc, "code", None) in (429, 503):
+        return True
+    return bool(re.search(r"\b(503|429)\b|UNAVAILABLE|RESOURCE_EXHAUSTED", msg))
 
 
 def _parse_json(raw: str | None) -> dict:
@@ -168,7 +178,7 @@ class OcrEngine:
 
     One multimodal call returns the document type, seller, dates, totals, tax,
     line items and raw text. Retries up to 4 times on 503/429 errors with
-    exponential backoff (2 s → 4 s → 8 s → 16 s).
+    exponential backoff (waits of 2 s, 4 s, 8 s between the 4 attempts).
     """
 
     def __init__(self, api_key: str, model: str = "gemini-3.6-flash"):
@@ -177,7 +187,7 @@ class OcrEngine:
 
     @retry(
         retry=retry_if_exception(_is_retryable),
-        wait=wait_exponential(multiplier=1, min=2, max=16),
+        wait=wait_exponential(multiplier=2, min=2, max=16),
         stop=stop_after_attempt(4),
         reraise=True,
     )

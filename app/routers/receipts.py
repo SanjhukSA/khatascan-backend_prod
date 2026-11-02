@@ -1,5 +1,7 @@
 """Receipt endpoints: upload, process (OCR), save, list, detail, update, delete."""
 
+import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
 from uuid import UUID
@@ -7,7 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.orm import Session, selectinload
 from starlette.concurrency import run_in_threadpool
 
@@ -21,6 +23,7 @@ from app.normalize import parse_date
 from app.ocr import OcrEngine, save_upload
 
 router = APIRouter(prefix="/receipts", tags=["receipts"])
+log = logging.getLogger("receipts.api")
 
 # ── Singleton OCR engine ─────────────────────────────────────────────────
 _ocr_engine = None
@@ -119,9 +122,14 @@ async def process_pages(
     The response's `upload_ids` are in document order. Pass them, in that order,
     to POST /receipts. Pages of different invoices, or a page uploaded twice, give 422.
     """
-    pages = []
-    for n, upload_id in enumerate(body.upload_ids, start=1):
-        pages.append(await _extract_page(upload_id, f" for page {n}"))
+    # OCR pages concurrently (max 4 at a time): a 6-page invoice shouldn't take 6x as long.
+    gate = asyncio.Semaphore(4)
+
+    async def _one(n: int, upload_id: UUID) -> dict:
+        async with gate:
+            return await _extract_page(upload_id, f" for page {n}")
+
+    pages = list(await asyncio.gather(*(_one(n, u) for n, u in enumerate(body.upload_ids, start=1))))
 
     try:
         merged = merge_pages(pages)
@@ -204,6 +212,9 @@ def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db)):
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="This receipt was already saved.")
+    except DataError:
+        db.rollback()
+        raise HTTPException(status_code=422, detail="A field value is too long or out of range.")
     db.refresh(receipt)
     return _receipt_to_out(receipt)
 
@@ -236,16 +247,20 @@ def list_receipts(
     if needs_review is not None:
         query = query.filter(Receipt.needs_review == needs_review)
     if q:
-        like = f"%{q.strip()}%"
-        query = query.filter(Receipt.vendor_name.ilike(like) | Receipt.invoice_number.ilike(like))
+        term = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{term}%"
+        query = query.filter(
+            Receipt.vendor_name.ilike(like, escape="\\") | Receipt.invoice_number.ilike(like, escape="\\")
+        )
 
     col = _SORTABLE[key]
-    query = query.order_by(col.desc() if sort.startswith("-") else col.asc(), Receipt.id)
+    ordering = col.desc() if sort.startswith("-") else col.asc()
+    query = query.order_by(ordering.nulls_last(), Receipt.id)   # undated receipts always at the end
 
     total = query.count()
     pages = max(1, -(-total // per_page))  # ceiling division
     receipts = (
-        query.options(selectinload(Receipt.items))   # one extra query instead of one per receipt
+        query.options(selectinload(Receipt.items), selectinload(Receipt.pages))   # no per-receipt queries
         .offset((page - 1) * per_page)
         .limit(per_page)
         .all()
@@ -284,6 +299,8 @@ def update_receipt(receipt_id: UUID, body: schemas.ReceiptUpdate, db: Session = 
 
     for field, value in update_data.items():
         setattr(receipt, field, value)
+    if update_data.get("needs_review") is False:
+        receipt.review_reason = None   # user confirmed it, so the old warning is stale
 
     if items_data is not None:
         receipt.items = [
@@ -296,6 +313,9 @@ def update_receipt(receipt_id: UUID, body: schemas.ReceiptUpdate, db: Session = 
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Another receipt already has this seller GSTIN + invoice number.")
+    except DataError:
+        db.rollback()
+        raise HTTPException(status_code=422, detail="A field value is too long or out of range.")
     db.refresh(receipt)
     return _receipt_to_out(receipt)
 
@@ -308,12 +328,11 @@ def delete_receipt(receipt_id: UUID, db: Session = Depends(get_db)):
     names = {receipt.image_path, receipt.thumbnail_path}
     for page in receipt.pages:
         names.update((page.image_path, page.thumbnail_path))
+    db.delete(receipt)
+    db.commit()   # row first: if this fails, the images are still there
     for name in names:
         if name:
             _stored_file(name).unlink(missing_ok=True)
-
-    db.delete(receipt)
-    db.commit()
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -381,8 +400,10 @@ async def _extract_page(upload_id: UUID, page_label: str = "") -> dict:
     image_bytes = await run_in_threadpool(image_path.read_bytes)
     try:
         return await run_in_threadpool(get_ocr_engine().extract_receipt, image_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OCR failed{page_label}: {e}")
+    except Exception:
+        # Details go to the log only: provider errors can contain URLs or keys.
+        log.exception("OCR failed%s for upload %s", page_label, upload_id)
+        raise HTTPException(status_code=502, detail=f"OCR failed{page_label}. Please try again in a moment.")
 
 
 def _to_process_response(upload_ids: list, extracted: dict, verdict) -> schemas.ProcessResponse:

@@ -83,12 +83,32 @@ def safe_float(value: Any) -> float:
     if isinstance(value, (int, float)):
         f = float(value)
         return f if math.isfinite(f) else 0.0
-    s = _CURRENCY_RE.sub("", str(value)).replace(",", "").replace(" ", "").strip()
+    s = str(value).replace("\xa0", " ").strip()
+    negative = s.startswith("(") and s.endswith(")")          # accounting style: (45.00)
+    s = _CURRENCY_RE.sub("", s)
+    s = s.replace("/-", "").replace("%", "").replace("(", "").replace(")", "")
+    s = re.sub(r"\s+", "", s)
+    if not s:
+        return 0.0
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):                        # 1.250,50 (European)
+            s = s.replace(".", "").replace(",", ".")
+        else:                                                  # 1,250.50
+            s = s.replace(",", "")
+    elif "," in s:
+        if re.fullmatch(r"-?\d{1,3}(,\d{3})+", s) or re.fullmatch(r"-?\d{1,2}(,\d{2})+,\d{3}", s):
+            s = s.replace(",", "")                             # 1,250 / 1,25,000 (Indian)
+        elif re.fullmatch(r"-?\d+,\d{1,2}", s):
+            s = s.replace(",", ".")                            # 340,50
+        else:
+            s = s.replace(",", "")
     try:
         f = float(s)
     except ValueError:
         return 0.0
-    return f if math.isfinite(f) else 0.0
+    if not math.isfinite(f):
+        return 0.0
+    return -f if negative and f > 0 else f
 
 
 # ── Dates ────────────────────────────────────────────────────────────────
@@ -117,6 +137,7 @@ def parse_date(text: Optional[str], today: Optional[date] = None) -> Optional[da
     if not text:
         return None
     s = str(text).strip()
+    s = re.sub(r"T\d{1,2}:\d{2}.*$", "", s)                    # ISO timestamp: 2026-04-03T10:22:00Z
     s = re.split(r"\s+\d{1,2}:\d{2}", s)[0]                    # drop any time part
     s = re.sub(r"(?<=\d)(st|nd|rd|th)\b", "", s, flags=re.I)   # 1st, 2nd, 16th
     s = re.sub(r"\bSept\b", "Sep", s, flags=re.I)
@@ -150,7 +171,44 @@ def normalize_doc_type(value: Optional[str]) -> str:
     key = re.sub(r"[\s\-]+", "_", str(value or "").strip().lower())
     if key in DOCUMENT_TYPES:
         return key
-    return _DOC_TYPE_ALIASES.get(key, "other")
+    if key in _DOC_TYPE_ALIASES:
+        return _DOC_TYPE_ALIASES[key]
+    # The model sometimes invents labels (restaurant_bill, cash_memo, pos_receipt...).
+    # Map them by keyword so real receipts aren't rejected as "other".
+    tokens = set(re.split(r"[_\W]+", key))
+    if "menu" in key or "price_list" in key:
+        return "menu"
+    if "id_card" in key or tokens & {"aadhaar", "aadhar", "passport", "licence", "license"}:
+        return "id_card"
+    if "handwritten" in key:
+        return "handwritten_bill"
+    if "gst" in key or "tax_invoice" in key:
+        return "gst_invoice"
+    if any(w in key for w in ("utility", "electricity")):
+        return "utility_bill"
+    if "payment" in key or "upi" in tokens:
+        return "payment_screenshot"
+    if "invoice" in key:
+        return "invoice"
+    if any(w in key for w in ("receipt", "bill", "memo")) or tokens & {"pos", "ebill", "supply"}:
+        return "printed_receipt"
+    return "other"
+
+
+_CURRENCY_SYMBOLS = {"₹": "INR", "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY"}
+
+
+def normalize_currency(value: Optional[str]) -> str:
+    """ISO-4217-looking code, mapping symbols and 'Rs.' / 'Rupees'. Unknown → INR."""
+    s = str(value or "").strip()
+    if not s:
+        return "INR"
+    if s in _CURRENCY_SYMBOLS:
+        return _CURRENCY_SYMBOLS[s]
+    if s.lower().rstrip(".") in ("rs", "rupee", "rupees", "inr"):
+        return "INR"
+    u = s.upper()
+    return u if re.fullmatch(r"[A-Z]{3}", u) else "INR"
 
 
 def normalize_gstin(value: Optional[str]) -> Optional[str]:
@@ -260,7 +318,7 @@ def normalize_extraction(raw: dict, today: Optional[date] = None) -> dict:
         date_problem = f"Couldn't read the date '{date_text}'. Please check it."
 
     level = normalize_level(raw.get("legibility") or raw.get("confidence"))
-    currency = (_clean_str(raw.get("currency"), 3) or "INR").upper()
+    currency = normalize_currency(raw.get("currency"))
 
     return {
         "document_type": normalize_doc_type(raw.get("document_type")),
@@ -274,7 +332,7 @@ def normalize_extraction(raw: dict, today: Optional[date] = None) -> dict:
         "total": round(total, 2),
         "tax_total": round(tax_total, 2),
         "discount_total": round(discount_total, 2),
-        "currency": currency if len(currency) == 3 else "INR",
+        "currency": currency,
         "category": normalize_category(raw.get("category")),
         "legibility": level,
         "confidence": level,
