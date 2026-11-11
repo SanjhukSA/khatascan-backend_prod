@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -56,13 +56,8 @@ _NOT_NULLABLE = {
 #  Step 1: Upload image (no OCR, no Gemini cost)
 # ═════════════════════════════════════════════════════════════════════════
 
-@router.post("/upload", response_model=schemas.UploadResponse)
-async def upload_receipt(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """
-    Upload a receipt image. Returns an upload_id to pass to
-    /receipts/{upload_id}/process. No Gemini call is made here.
-    Uploads that are never saved are deleted automatically (see cleanup.py).
-    """
+async def _ingest(file: UploadFile) -> tuple[str, float]:
+    """Validate and store one uploaded image. Returns (upload_id, size_kb)."""
     # Read at most limit+1 bytes: an oversized file is rejected without loading all of it.
     image_bytes = await file.read(settings.max_upload_bytes + 1)
 
@@ -79,16 +74,50 @@ async def upload_receipt(file: UploadFile = File(...), db: Session = Depends(get
             status_code=415,
             detail="Unsupported or corrupt image. Please upload a JPEG or PNG photo.",
         )
+    return upload_id, round(len(image_bytes) / 1024, 1)
 
+
+async def _already_saved(db: Session, upload_id: str) -> Optional[str]:
+    """Id of a saved receipt that already holds an identical image, if any."""
     stored = Path(settings.upload_dir) / f"{upload_id}.jpg"
-    saved_id = await run_in_threadpool(lambda: find_receipt_by_hash(db, file_sha256(stored)))
+    found = await run_in_threadpool(lambda: find_receipt_by_hash(db, file_sha256(stored)))
+    return str(found) if found else None
 
-    return schemas.UploadResponse(
-        upload_id=upload_id,
-        filename=file.filename or "receipt.jpg",
-        size_kb=round(len(image_bytes) / 1024, 1),
-        already_saved_receipt_id=str(saved_id) if saved_id else None,
-    )
+
+@router.post("/upload-many", response_model=schemas.UploadManyResponse)
+async def upload_many(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
+    """
+    Upload one or several images in one request (up to MAX_PAGES_PER_INVOICE, default 10).
+    Returns an upload_id per file, in the order sent: pass them to POST /receipts/process-pages
+    (it also works for a single image). All-or-nothing: if any file is rejected, none are kept
+    and the error names the bad file.
+    """
+    limit = settings.max_pages_per_invoice
+    if not files:
+        raise HTTPException(status_code=422, detail="No files sent.")
+    if len(files) > limit:
+        raise HTTPException(status_code=422, detail=f"Too many files: the limit is {limit} per invoice.")
+
+    stored: list[schemas.UploadResponse] = []
+    try:
+        for f in files:
+            name = f.filename or "receipt.jpg"
+            try:
+                upload_id, size_kb = await _ingest(f)
+            except HTTPException as e:
+                raise HTTPException(status_code=e.status_code, detail=f"{name}: {e.detail}")
+            stored.append(schemas.UploadResponse(
+                upload_id=upload_id,
+                filename=name,
+                size_kb=size_kb,
+                already_saved_receipt_id=await _already_saved(db, upload_id),
+            ))
+    except HTTPException:
+        for u in stored:                       # leave nothing behind from a failed batch
+            _stored_file(f"{u.upload_id}.jpg").unlink(missing_ok=True)
+            _stored_file(f"{u.upload_id}_thumb.jpg").unlink(missing_ok=True)
+        raise
+    return schemas.UploadManyResponse(uploads=stored)
 
 
 # ═════════════════════════════════════════════════════════════════════════

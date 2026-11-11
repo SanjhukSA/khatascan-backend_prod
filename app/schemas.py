@@ -7,6 +7,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.config import settings
 from app.normalize import (
     GSTIN_RE,
     normalize_category,
@@ -102,7 +103,7 @@ class _ReceiptFieldCleaning(BaseModel):
         return None if v is None else normalize_currency(v)
 
 
-MAX_PAGES = 20
+MAX_PAGES = settings.max_pages_per_invoice
 
 
 def _unique_ids(v: List[UUID]) -> List[UUID]:
@@ -119,12 +120,17 @@ class ProcessPagesRequest(BaseModel):
 
 
 class UploadResponse(BaseModel):
-    """Returned by POST /receipts/upload (step 1, no OCR yet)."""
+    """One uploaded image (step 1, no OCR yet). Returned inside POST /receipts/upload-many."""
     upload_id: str
     filename: str
     size_kb: float
     # Set when an identical image is already saved: warn the user before spending an OCR call.
     already_saved_receipt_id: Optional[str] = None
+
+
+class UploadManyResponse(BaseModel):
+    """Returned by POST /receipts/upload-many: one entry per file, in the order sent."""
+    uploads: List[UploadResponse]
 
 
 class ProcessResponse(BaseModel):
