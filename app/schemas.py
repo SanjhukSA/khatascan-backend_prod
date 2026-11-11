@@ -123,6 +123,8 @@ class UploadResponse(BaseModel):
     upload_id: str
     filename: str
     size_kb: float
+    # Set when an identical image is already saved: warn the user before spending an OCR call.
+    already_saved_receipt_id: Optional[str] = None
 
 
 class ProcessResponse(BaseModel):
@@ -156,6 +158,10 @@ class ProcessResponse(BaseModel):
 
     items: List[LineItemBase] = []
     raw_ocr_text: str = ""
+
+    # Advisory only: the UI should offer "save anyway", never block.
+    possible_duplicate_of: Optional[str] = None
+    duplicate_warning: Optional[str] = None
 
 
 class ReceiptCreate(_ReceiptFieldCleaning):

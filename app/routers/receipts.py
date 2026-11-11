@@ -17,6 +17,7 @@ from app import schemas
 from app.config import settings
 from app.decision import REJECTED, decide
 from app.dependencies import get_db
+from app.duplicates import file_sha256, find_possible_duplicate, find_receipt_by_hash
 from app.merge import MergeError, merge_pages
 from app.models import Receipt, ReceiptItem, ReceiptPage
 from app.normalize import parse_date
@@ -56,7 +57,7 @@ _NOT_NULLABLE = {
 # ═════════════════════════════════════════════════════════════════════════
 
 @router.post("/upload", response_model=schemas.UploadResponse)
-async def upload_receipt(file: UploadFile = File(...)):
+async def upload_receipt(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Upload a receipt image. Returns an upload_id to pass to
     /receipts/{upload_id}/process. No Gemini call is made here.
@@ -79,10 +80,14 @@ async def upload_receipt(file: UploadFile = File(...)):
             detail="Unsupported or corrupt image. Please upload a JPEG or PNG photo.",
         )
 
+    stored = Path(settings.upload_dir) / f"{upload_id}.jpg"
+    saved_id = await run_in_threadpool(lambda: find_receipt_by_hash(db, file_sha256(stored)))
+
     return schemas.UploadResponse(
         upload_id=upload_id,
         filename=file.filename or "receipt.jpg",
         size_kb=round(len(image_bytes) / 1024, 1),
+        already_saved_receipt_id=str(saved_id) if saved_id else None,
     )
 
 
@@ -97,6 +102,7 @@ async def process_receipt(
         False,
         description="User override: treat a rejected menu/ID/other image as a receipt (still flagged for review).",
     ),
+    db: Session = Depends(get_db),
 ):
     """
     Run OCR on one uploaded image, then apply the accept / needs_review / rejected
@@ -106,13 +112,14 @@ async def process_receipt(
     """
     extracted = await _extract_page(upload_id)
     verdict = decide(extracted, force=force)
-    return _to_process_response([upload_id], extracted, verdict)
+    return await _flag_duplicate(db, _to_process_response([upload_id], extracted, verdict), extracted)
 
 
 @router.post("/process-pages", response_model=schemas.ProcessResponse)
 async def process_pages(
     body: schemas.ProcessPagesRequest,
     force: bool = Query(False, description="Same override as the single-page endpoint."),
+    db: Session = Depends(get_db),
 ):
     """
     Run OCR on every page of one invoice and merge them into a single result:
@@ -138,7 +145,7 @@ async def process_pages(
 
     ordered_ids = [body.upload_ids[i] for i in merged["page_order"]]
     verdict = decide(merged, force=force)
-    return _to_process_response(ordered_ids, merged, verdict)
+    return await _flag_duplicate(db, _to_process_response(ordered_ids, merged, verdict), merged)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -162,6 +169,8 @@ def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db)):
                 status_code=404,
                 detail=f"Upload image for page {n} not found. Please re-upload it.",
             )
+
+    page_hashes = [file_sha256(_stored_file(n)) for n in image_names]
 
     if db.query(ReceiptPage.id).filter(ReceiptPage.image_path.in_(image_names)).first():
         raise HTTPException(status_code=409, detail="One of these uploads was already saved as a receipt.")
@@ -202,8 +211,8 @@ def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db)):
         thumbnail_path=thumb_names[0],
         items=[ReceiptItem(position=i, **item.model_dump()) for i, item in enumerate(body.items)],
         pages=[
-            ReceiptPage(page_number=n, image_path=img, thumbnail_path=thumb)
-            for n, (img, thumb) in enumerate(zip(image_names, thumb_names), start=1)
+            ReceiptPage(page_number=n, image_path=img, thumbnail_path=thumb, content_hash=digest)
+            for n, (img, thumb, digest) in enumerate(zip(image_names, thumb_names, page_hashes), start=1)
         ],
     )
     db.add(receipt)
@@ -404,6 +413,16 @@ async def _extract_page(upload_id: UUID, page_label: str = "") -> dict:
         # Details go to the log only: provider errors can contain URLs or keys.
         log.exception("OCR failed%s for upload %s", page_label, upload_id)
         raise HTTPException(status_code=502, detail=f"OCR failed{page_label}. Please try again in a moment.")
+
+
+async def _flag_duplicate(db: Session, resp: schemas.ProcessResponse, extracted: dict) -> schemas.ProcessResponse:
+    """Attach a possible-duplicate warning. Never changes the status: the user decides."""
+    if resp.status == REJECTED:
+        return resp
+    hit = await run_in_threadpool(find_possible_duplicate, db, extracted)
+    if hit:
+        resp.possible_duplicate_of, resp.duplicate_warning = str(hit[0]), hit[1]
+    return resp
 
 
 def _to_process_response(upload_ids: list, extracted: dict, verdict) -> schemas.ProcessResponse:

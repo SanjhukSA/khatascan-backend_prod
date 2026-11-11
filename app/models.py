@@ -102,6 +102,7 @@ class ReceiptPage(Base):
     page_number = Column(Integer, nullable=False)  # 1-based, in document order
     image_path = Column(String(500), nullable=False, unique=True)
     thumbnail_path = Column(String(500), nullable=True)
+    content_hash = Column(String(64), nullable=True, index=True)  # SHA-256 of the stored JPEG
 
     receipt = relationship("Receipt", back_populates="pages")
 
