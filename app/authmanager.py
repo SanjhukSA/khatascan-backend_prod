@@ -40,6 +40,27 @@ def decode_access_token(token: str) -> Optional[uuid.UUID]:
     """The user id inside a valid, unexpired token, else None."""
     try:
         payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
+        if payload.get("typ") not in (None, "access"):   # an image-link token is not a login token
+            return None
+        return uuid.UUID(payload["sub"])
+    except (JWTError, KeyError, ValueError):
+        return None
+
+
+def create_image_token(user_id: uuid.UUID, receipt_id: uuid.UUID, ttl_seconds: Optional[int] = None) -> str:
+    """Short-lived token that only opens the images of ONE receipt (used as ?sig=... in image URLs)."""
+    ttl = ttl_seconds if ttl_seconds is not None else settings.image_url_ttl_seconds
+    expire = datetime.now(timezone.utc) + timedelta(seconds=ttl)
+    claims = {"sub": str(user_id), "typ": "img", "rid": str(receipt_id), "exp": expire}
+    return jwt.encode(claims, settings.jwt_secret_key, algorithm=ALGORITHM)
+
+
+def decode_image_token(token: str, receipt_id: uuid.UUID) -> Optional[uuid.UUID]:
+    """The user id inside a valid image token for exactly this receipt, else None."""
+    try:
+        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[ALGORITHM])
+        if payload.get("typ") != "img" or payload.get("rid") != str(receipt_id):
+            return None
         return uuid.UUID(payload["sub"])
     except (JWTError, KeyError, ValueError):
         return None

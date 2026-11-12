@@ -32,6 +32,22 @@ class User(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class Upload(Base):
+    """An image that was uploaded but not saved as a receipt yet.
+
+    `id` is the upload_id the client holds (it is also the file name stem on disk).
+    The row is deleted in the same transaction that saves the receipt; the cleanup job
+    removes rows (and files) that never got saved."""
+
+    __tablename__ = "uploads"
+
+    id = Column(Uuid(as_uuid=True), primary_key=True)
+    user_id = Column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
 class Receipt(Base):
     """One receipt / bill / invoice. Only fields we query or sum are columns;
     everything else printed on the document stays in raw_ocr_text."""

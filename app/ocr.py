@@ -6,6 +6,7 @@ policy lives in app.decision, not here.
 
 import io
 import json
+import logging
 import re
 import uuid
 from pathlib import Path
@@ -14,9 +15,18 @@ import httpx
 from google import genai
 from google.genai import types
 from PIL import Image, ImageOps
-from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.normalize import normalize_extraction
+
+try:   # iPhone gallery photos are often HEIC; this lets Pillow read them (pip install pillow-heif)
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
+
+log = logging.getLogger("receipts.ocr")
 
 # Longest side before we downscale. Keeps Gemini payloads small and prevents
 # memory spikes from 48 MP phone cameras.
@@ -180,43 +190,53 @@ class OcrEngine:
     Receipt extractor backed by Google Gemini Flash (google-genai SDK).
 
     One multimodal call returns the document type, seller, dates, totals, tax,
-    line items and raw text. Retries up to 4 times on 503/429 errors with
-    exponential backoff (waits of 2 s, 4 s, 8 s between the 4 attempts).
+    line items and raw text.
+
+    For each model, a call is retried up to `max_attempts` times on 503 / 429 / network
+    errors with exponential backoff (2 s, 4 s, 8 s between 4 attempts). If a model still
+    fails (retries used up, a daily quota, an empty or unparseable reply), the next model
+    in `fallback_models` is tried. The last error is raised if every model fails.
     """
 
-    def __init__(self, api_key: str, model: str = "gemini-3.5-flash-lite"):
+    retry_wait = wait_exponential(multiplier=2, min=2, max=8)   # tests can replace this with wait_none()
+
+    def __init__(self, api_key: str, model: str, fallback_models=(), max_attempts: int = 4):
         self.client = genai.Client(api_key=api_key)
         self.model = model
-        self.fallback_models = [model, "gemini-3-flash-preview", "gemini-3.5-flash-lite"]
+        self.models = list(dict.fromkeys([model, *fallback_models]))   # no duplicates, order kept
+        self.max_attempts = max(1, max_attempts)
 
-    def _call_gemini(self, jpeg_bytes: bytes) -> str | None:
-        image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
-        last_err = None
-
-        # Try models in sequence with retry per model
-        models_to_try = []
-        for m in self.fallback_models:
-            if m not in models_to_try:
-                models_to_try.append(m)
-
-        for candidate_model in models_to_try:
-            try:
+    def _generate(self, model: str, image_part) -> str:
+        for attempt in Retrying(
+            retry=retry_if_exception(_is_retryable),
+            stop=stop_after_attempt(self.max_attempts),
+            wait=self.retry_wait,
+            reraise=True,
+        ):
+            with attempt:
                 response = self.client.models.generate_content(
-                    model=candidate_model,
+                    model=model,
                     contents=[_EXTRACTION_PROMPT, image_part],
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json",
                         temperature=0.0,
                     ),
                 )
-                return response.text
-            except Exception as e:
-                last_err = e
-                continue
+                return response.text or ""
+        raise RuntimeError("unreachable")   # Retrying always returns or raises above
 
-        if last_err:
-            raise last_err
-        return None
+    def _call_gemini(self, jpeg_bytes: bytes) -> dict:
+        """Run the extraction with retries and model fallback; returns the parsed JSON dict."""
+        image_part = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
+        last_err: Exception | None = None
+        for model in self.models:
+            try:
+                return _parse_json(self._generate(model, image_part))
+            except Exception as exc:
+                last_err = exc
+                # Type and status code only: provider messages can contain URLs or keys.
+                log.warning("OCR model %s failed: %s (code=%s)", model, type(exc).__name__, getattr(exc, "code", None))
+        raise last_err if last_err else RuntimeError("No OCR model configured")
 
     def extract_receipt(self, image_bytes: bytes) -> dict:
         """Run extraction and return the normalized dict (see app.normalize)."""
@@ -224,6 +244,6 @@ class OcrEngine:
         buf = io.BytesIO()
         image.save(buf, format="JPEG", quality=85)
 
-        data = _parse_json(self._call_gemini(buf.getvalue()))
+        data = self._call_gemini(buf.getvalue())
         data["engine"] = "gemini"
         return normalize_extraction(data)

@@ -2,11 +2,13 @@
 
 from typing import Generator, Optional
 
+from uuid import UUID
+
 from fastapi import Depends, HTTPException, Query
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
-from app.authmanager import decode_access_token
+from app.authmanager import decode_access_token, decode_image_token
 from app.database import SessionLocal
 from app.models import User
 
@@ -39,11 +41,23 @@ def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session 
     return _user_from_token(token, db)
 
 
-def get_current_user_allow_query(
+def get_image_user(
+    receipt_id: UUID,
     token: Optional[str] = Depends(oauth2_scheme),
-    query_token: Optional[str] = Query(None, alias="token", include_in_schema=False),
+    sig: Optional[str] = Query(None, include_in_schema=False),
     db: Session = Depends(get_db),
 ) -> User:
-    """Same, but also accepts ?token=... Used ONLY by the image endpoints, so a plain
-    <img src="..."> works (browsers can't add headers to image requests)."""
-    return _user_from_token(token or query_token, db)
+    """For the image endpoints only. Accepts the normal Bearer header, or a short-lived
+    `?sig=` token that is valid for this one receipt (so a plain <img src> works without
+    putting the login token in the URL)."""
+    user_id = decode_access_token(token) if token else None
+    if user_id is None and sig:
+        user_id = decode_image_token(sig, receipt_id)
+    user = db.get(User, user_id) if user_id else None
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user

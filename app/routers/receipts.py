@@ -9,22 +9,28 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
-from sqlalchemy.exc import DataError, IntegrityError
+from sqlalchemy.exc import DataError, IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 from starlette.concurrency import run_in_threadpool
 
 from app import schemas
+from app.authmanager import create_image_token
 from app.config import settings
 from app.decision import REJECTED, decide
-from app.dependencies import get_current_user, get_current_user_allow_query, get_db
+from app.dependencies import get_current_user, get_db, get_image_user
 from app.duplicates import file_sha256, find_possible_duplicate, find_receipt_by_hash
 from app.merge import MergeError, merge_pages
-from app.models import Receipt, ReceiptItem, ReceiptPage, User
+from app.models import Receipt, ReceiptItem, ReceiptPage, Upload, User
 from app.normalize import parse_date
 from app.ocr import OcrEngine, save_upload
+from app.ratelimit import limiter
 
 router = APIRouter(prefix="/receipts", tags=["receipts"])
 log = logging.getLogger("receipts.api")
+
+# Per-user limits (numbers live in settings; each OCR page is one paid Gemini call).
+UPLOAD_RULES = [("upload_hour", "upload_files_per_hour", 3600)]
+OCR_RULES = [("ocr_hour", "ocr_pages_per_hour", 3600), ("ocr_day", "ocr_pages_per_day", 86400)]
 
 # ── Singleton OCR engine ─────────────────────────────────────────────────
 _ocr_engine = None
@@ -33,7 +39,12 @@ _ocr_engine = None
 def get_ocr_engine() -> OcrEngine:
     global _ocr_engine
     if _ocr_engine is None:
-        _ocr_engine = OcrEngine(api_key=settings.gemini_api_key, model=settings.gemini_model)
+        _ocr_engine = OcrEngine(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_model,
+            fallback_models=settings.gemini_fallbacks,
+            max_attempts=settings.ocr_max_attempts,
+        )
     return _ocr_engine
 
 
@@ -98,6 +109,8 @@ async def upload_many(files: List[UploadFile] = File(...), db: Session = Depends
     if len(files) > limit:
         raise HTTPException(status_code=422, detail=f"Too many files: the limit is {limit} per invoice.")
 
+    limiter.hit(str(user.id), UPLOAD_RULES, cost=len(files))
+
     stored: list[schemas.UploadResponse] = []
     try:
         for f in files:
@@ -112,10 +125,14 @@ async def upload_many(files: List[UploadFile] = File(...), db: Session = Depends
                 size_kb=size_kb,
                 already_saved_receipt_id=await _already_saved(db, upload_id, user.id),
             ))
-    except HTTPException:
-        for u in stored:                       # leave nothing behind from a failed batch
-            _stored_file(f"{u.upload_id}.jpg").unlink(missing_ok=True)
-            _stored_file(f"{u.upload_id}_thumb.jpg").unlink(missing_ok=True)
+        # Remember who owns each upload: only they can process or save it.
+        await run_in_threadpool(_record_uploads, db, user.id, [u.upload_id for u in stored])
+    except SQLAlchemyError:
+        log.exception("Could not record uploads")
+        _discard_uploads(stored)
+        raise HTTPException(status_code=500, detail="Could not store the upload. Please try again.")
+    except Exception:
+        _discard_uploads(stored)           # leave nothing behind from a failed batch
         raise
     return schemas.UploadManyResponse(uploads=stored)
 
@@ -140,6 +157,8 @@ async def process_receipt(
     HTTP 200 is returned for all three statuses; check `status` in the body.
     For an invoice that spans several images use POST /receipts/process-pages.
     """
+    await run_in_threadpool(_require_owned_uploads, db, [upload_id], user)
+    limiter.hit(str(user.id), OCR_RULES)
     extracted = await _extract_page(upload_id)
     verdict = decide(extracted, force=force)
     return await _flag_duplicate(db, _to_process_response([upload_id], extracted, verdict), extracted, user.id)
@@ -160,6 +179,9 @@ async def process_pages(
     The response's `upload_ids` are in document order. Pass them, in that order,
     to POST /receipts. Pages of different invoices, or a page uploaded twice, give 422.
     """
+    await run_in_threadpool(_require_owned_uploads, db, body.upload_ids, user)
+    limiter.hit(str(user.id), OCR_RULES, cost=len(body.upload_ids))
+
     # OCR pages concurrently (max 4 at a time): a 6-page invoice shouldn't take 6x as long.
     gate = asyncio.Semaphore(4)
 
@@ -194,6 +216,17 @@ def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db), use
     image_names = [f"{u}.jpg" for u in body.upload_ids]
     thumb_names = [f"{u}_thumb.jpg" for u in body.upload_ids]
 
+    # Saved already (e.g. a double tap on "Save")? Say so before anything else.
+    if (
+        db.query(ReceiptPage.id)
+        .join(Receipt, Receipt.id == ReceiptPage.receipt_id)
+        .filter(ReceiptPage.image_path.in_(image_names), Receipt.user_id == user.id)
+        .first()
+    ):
+        raise HTTPException(status_code=409, detail="One of these uploads was already saved as a receipt.")
+
+    _require_owned_uploads(db, body.upload_ids, user)
+
     for n, name in enumerate(image_names, start=1):
         if not _stored_file(name).exists():
             raise HTTPException(
@@ -202,9 +235,6 @@ def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db), use
             )
 
     page_hashes = [file_sha256(_stored_file(n)) for n in image_names]
-
-    if db.query(ReceiptPage.id).filter(ReceiptPage.image_path.in_(image_names)).first():
-        raise HTTPException(status_code=409, detail="One of these uploads was already saved as a receipt.")
 
     if body.vendor_gstin and body.invoice_number:
         dup = (
@@ -249,8 +279,10 @@ def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db), use
         ],
     )
     db.add(receipt)
+    # The uploads are now owned by the receipt: drop the pending rows in the same transaction.
+    db.query(Upload).filter(Upload.id.in_(body.upload_ids)).delete(synchronize_session=False)
     try:
-        db.commit()   # receipt + items + pages in one transaction: all or nothing
+        db.commit()   # receipt + items + pages + upload rows in one transaction: all or nothing
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="This receipt was already saved.")
@@ -383,7 +415,7 @@ def delete_receipt(receipt_id: UUID, db: Session = Depends(get_db), user: User =
 # ═════════════════════════════════════════════════════════════════════════
 
 @router.get("/{receipt_id}/image")
-def get_receipt_image(receipt_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user_allow_query)):
+def get_receipt_image(receipt_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_image_user)):
     """Serve the receipt image (JPEG, max 1600 px)."""
     receipt = _get_or_404(db, receipt_id, user)
     if not receipt.image_path:
@@ -391,11 +423,11 @@ def get_receipt_image(receipt_id: UUID, db: Session = Depends(get_db), user: Use
     path = _stored_file(receipt.image_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Image file missing from disk")
-    return FileResponse(path, media_type="image/jpeg")
+    return _image_response(path)
 
 
 @router.get("/{receipt_id}/thumbnail")
-def get_receipt_thumbnail(receipt_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user_allow_query)):
+def get_receipt_thumbnail(receipt_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_image_user)):
     """Serve the receipt thumbnail."""
     receipt = _get_or_404(db, receipt_id, user)
     if not receipt.thumbnail_path:
@@ -403,21 +435,21 @@ def get_receipt_thumbnail(receipt_id: UUID, db: Session = Depends(get_db), user:
     path = _stored_file(receipt.thumbnail_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Thumbnail file missing from disk")
-    return FileResponse(path, media_type="image/jpeg")
+    return _image_response(path)
 
 
 @router.get("/{receipt_id}/pages/{page_number}/image")
-def get_page_image(receipt_id: UUID, page_number: int, db: Session = Depends(get_db), user: User = Depends(get_current_user_allow_query)):
+def get_page_image(receipt_id: UUID, page_number: int, db: Session = Depends(get_db), user: User = Depends(get_image_user)):
     """Serve one page's image (1-based page_number)."""
     page = _get_page_or_404(db, receipt_id, page_number, user)
     path = _stored_file(page.image_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Image file missing from disk")
-    return FileResponse(path, media_type="image/jpeg")
+    return _image_response(path)
 
 
 @router.get("/{receipt_id}/pages/{page_number}/thumbnail")
-def get_page_thumbnail(receipt_id: UUID, page_number: int, db: Session = Depends(get_db), user: User = Depends(get_current_user_allow_query)):
+def get_page_thumbnail(receipt_id: UUID, page_number: int, db: Session = Depends(get_db), user: User = Depends(get_image_user)):
     """Serve one page's thumbnail (1-based page_number)."""
     page = _get_page_or_404(db, receipt_id, page_number, user)
     if not page.thumbnail_path:
@@ -425,7 +457,7 @@ def get_page_thumbnail(receipt_id: UUID, page_number: int, db: Session = Depends
     path = _stored_file(page.thumbnail_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Thumbnail file missing from disk")
-    return FileResponse(path, media_type="image/jpeg")
+    return _image_response(path)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -534,7 +566,15 @@ def _get_or_404(db: Session, receipt_id: UUID, user: User) -> Receipt:
 
 
 def _receipt_to_out(receipt: Receipt) -> schemas.ReceiptOut:
-    """Convert a Receipt ORM model to ReceiptOut, adding image URLs."""
+    """Convert a Receipt ORM model to ReceiptOut, adding signed image URLs.
+
+    Every image URL carries `?sig=...`, a short-lived token that opens only this receipt's
+    images, so the app can use plain <img src> without exposing the login token."""
+    sig = create_image_token(receipt.user_id, receipt.id) if receipt.user_id else None
+
+    def url(path: str) -> str:
+        return f"{path}?sig={sig}" if sig else path
+
     return schemas.ReceiptOut(
         id=receipt.id,
         vendor_name=receipt.vendor_name,
@@ -556,15 +596,46 @@ def _receipt_to_out(receipt: Receipt) -> schemas.ReceiptOut:
         pages=[
             schemas.PageOut(
                 page_number=p.page_number,
-                image_url=f"/receipts/{receipt.id}/pages/{p.page_number}/image",
+                image_url=url(f"/receipts/{receipt.id}/pages/{p.page_number}/image"),
                 thumbnail_url=(
-                    f"/receipts/{receipt.id}/pages/{p.page_number}/thumbnail" if p.thumbnail_path else None
+                    url(f"/receipts/{receipt.id}/pages/{p.page_number}/thumbnail") if p.thumbnail_path else None
                 ),
             )
             for p in receipt.pages
         ],
         raw_ocr_text=receipt.raw_ocr_text or "",
-        image_url=f"/receipts/{receipt.id}/image" if receipt.image_path else None,
-        thumbnail_url=f"/receipts/{receipt.id}/thumbnail" if receipt.thumbnail_path else None,
+        image_url=url(f"/receipts/{receipt.id}/image") if receipt.image_path else None,
+        thumbnail_url=url(f"/receipts/{receipt.id}/thumbnail") if receipt.thumbnail_path else None,
         created_at=receipt.created_at,
     )
+
+
+def _image_response(path: Path) -> FileResponse:
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
+
+
+def _record_uploads(db: Session, user_id: UUID, upload_ids: List[str]) -> None:
+    db.add_all([Upload(id=UUID(u), user_id=user_id) for u in upload_ids])
+    db.commit()
+
+
+def _discard_uploads(stored: list) -> None:
+    """Delete the files of uploads from a failed batch (their rows were never committed)."""
+    for u in stored:
+        _stored_file(f"{u.upload_id}.jpg").unlink(missing_ok=True)
+        _stored_file(f"{u.upload_id}_thumb.jpg").unlink(missing_ok=True)
+
+
+def _require_owned_uploads(db: Session, upload_ids: List[UUID], user: User) -> None:
+    """404 unless every upload id is a pending upload of this user."""
+    found = {
+        r.id for r in db.query(Upload.id).filter(Upload.id.in_(list(upload_ids)), Upload.user_id == user.id)
+    }
+    for n, upload_id in enumerate(upload_ids, start=1):
+        if upload_id not in found:
+            label = f" for page {n}" if len(upload_ids) > 1 else ""
+            raise HTTPException(
+                status_code=404,
+                detail=f"Upload{label} not found. It may have been cleaned up, please re-upload.",
+            )
+
