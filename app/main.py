@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import analytics, auth, receipts
+from app.routers import analytics, auth, receipts
 from app.cleanup import cleanup_loop
 from app.config import settings
 from app.database import Base, engine
