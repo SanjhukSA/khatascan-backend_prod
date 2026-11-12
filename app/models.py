@@ -21,6 +21,17 @@ from sqlalchemy.orm import relationship
 from app.database import Base
 
 
+class User(Base):
+    """An account. Only the bcrypt hash of the password is stored."""
+
+    __tablename__ = "users"
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(50), nullable=False, unique=True, index=True)  # stored lowercase
+    password_hash = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Receipt(Base):
     """One receipt / bill / invoice. Only fields we query or sum are columns;
     everything else printed on the document stays in raw_ocr_text."""
@@ -29,10 +40,14 @@ class Receipt(Base):
     __table_args__ = (
         # Same seller + same invoice number = same invoice. (NULLs never collide,
         # so receipts without a GSTIN / invoice number are unaffected.)
-        UniqueConstraint("vendor_gstin", "invoice_number", name="uq_receipt_vendor_invoice"),
+        UniqueConstraint("user_id", "vendor_gstin", "invoice_number", name="uq_receipt_vendor_invoice"),
     )
 
     id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Owner. Nullable only so rows from before accounts existed survive the migration.
+    user_id = Column(
+        Uuid(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
 
     # ── Who / what ───────────────────────────────────────────────────
     vendor_name = Column(String(255), nullable=False, default="Unknown Vendor")

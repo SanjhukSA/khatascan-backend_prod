@@ -18,6 +18,43 @@ from app.normalize import (
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  Auth
+# ═════════════════════════════════════════════════════════════════════════
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=3, max_length=30)
+    password: str = Field(min_length=8, max_length=72)
+
+    @field_validator("username")
+    @classmethod
+    def _username(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not re.fullmatch(r"[a-z0-9_.-]{3,30}", v):
+            raise ValueError("username may only contain letters, digits, '.', '_' and '-' (3-30 characters)")
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def _password(cls, v: str) -> str:
+        if len(v.encode("utf-8")) > 72:     # bcrypt only uses the first 72 bytes
+            raise ValueError("password is too long (max 72 bytes)")
+        return v
+
+
+class UserOut(BaseModel):
+    id: UUID
+    username: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserOut
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  Line items
 # ═════════════════════════════════════════════════════════════════════════
 

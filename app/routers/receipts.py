@@ -16,10 +16,10 @@ from starlette.concurrency import run_in_threadpool
 from app import schemas
 from app.config import settings
 from app.decision import REJECTED, decide
-from app.dependencies import get_db
+from app.dependencies import get_current_user, get_current_user_allow_query, get_db
 from app.duplicates import file_sha256, find_possible_duplicate, find_receipt_by_hash
 from app.merge import MergeError, merge_pages
-from app.models import Receipt, ReceiptItem, ReceiptPage
+from app.models import Receipt, ReceiptItem, ReceiptPage, User
 from app.normalize import parse_date
 from app.ocr import OcrEngine, save_upload
 
@@ -77,31 +77,15 @@ async def _ingest(file: UploadFile) -> tuple[str, float]:
     return upload_id, round(len(image_bytes) / 1024, 1)
 
 
-async def _already_saved(db: Session, upload_id: str) -> Optional[str]:
+async def _already_saved(db: Session, upload_id: str, user_id: UUID) -> Optional[str]:
     """Id of a saved receipt that already holds an identical image, if any."""
     stored = Path(settings.upload_dir) / f"{upload_id}.jpg"
-    found = await run_in_threadpool(lambda: find_receipt_by_hash(db, file_sha256(stored)))
+    found = await run_in_threadpool(lambda: find_receipt_by_hash(db, file_sha256(stored), user_id))
     return str(found) if found else None
 
 
-@router.post("/upload", response_model=schemas.UploadResponse)
-async def upload_one(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    """
-    Upload a single receipt image (Step 1, single-file variant).
-    Returns one upload_id; pass it to POST /receipts/{upload_id}/process next.
-    """
-    name = file.filename or "receipt.jpg"
-    upload_id, size_kb = await _ingest(file)
-    return schemas.UploadResponse(
-        upload_id=upload_id,
-        filename=name,
-        size_kb=size_kb,
-        already_saved_receipt_id=await _already_saved(db, upload_id),
-    )
-
-
 @router.post("/upload-many", response_model=schemas.UploadManyResponse)
-async def upload_many(files: List[UploadFile] = File(...), db: Session = Depends(get_db)):
+async def upload_many(files: List[UploadFile] = File(...), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
     Upload one or several images in one request (up to MAX_PAGES_PER_INVOICE, default 10).
     Returns an upload_id per file, in the order sent: pass them to POST /receipts/process-pages
@@ -126,7 +110,7 @@ async def upload_many(files: List[UploadFile] = File(...), db: Session = Depends
                 upload_id=upload_id,
                 filename=name,
                 size_kb=size_kb,
-                already_saved_receipt_id=await _already_saved(db, upload_id),
+                already_saved_receipt_id=await _already_saved(db, upload_id, user.id),
             ))
     except HTTPException:
         for u in stored:                       # leave nothing behind from a failed batch
@@ -148,6 +132,7 @@ async def process_receipt(
         description="User override: treat a rejected menu/ID/other image as a receipt (still flagged for review).",
     ),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Run OCR on one uploaded image, then apply the accept / needs_review / rejected
@@ -157,7 +142,7 @@ async def process_receipt(
     """
     extracted = await _extract_page(upload_id)
     verdict = decide(extracted, force=force)
-    return await _flag_duplicate(db, _to_process_response([upload_id], extracted, verdict), extracted)
+    return await _flag_duplicate(db, _to_process_response([upload_id], extracted, verdict), extracted, user.id)
 
 
 @router.post("/process-pages", response_model=schemas.ProcessResponse)
@@ -165,6 +150,7 @@ async def process_pages(
     body: schemas.ProcessPagesRequest,
     force: bool = Query(False, description="Same override as the single-page endpoint."),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Run OCR on every page of one invoice and merge them into a single result:
@@ -174,8 +160,8 @@ async def process_pages(
     The response's `upload_ids` are in document order. Pass them, in that order,
     to POST /receipts. Pages of different invoices, or a page uploaded twice, give 422.
     """
-    # Process pages sequentially (gate=1) so Gemini rate limits (RPM / concurrency) are never exceeded.
-    gate = asyncio.Semaphore(1)
+    # OCR pages concurrently (max 4 at a time): a 6-page invoice shouldn't take 6x as long.
+    gate = asyncio.Semaphore(4)
 
     async def _one(n: int, upload_id: UUID) -> dict:
         async with gate:
@@ -190,7 +176,7 @@ async def process_pages(
 
     ordered_ids = [body.upload_ids[i] for i in merged["page_order"]]
     verdict = decide(merged, force=force)
-    return await _flag_duplicate(db, _to_process_response(ordered_ids, merged, verdict), merged)
+    return await _flag_duplicate(db, _to_process_response(ordered_ids, merged, verdict), merged, user.id)
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -198,7 +184,7 @@ async def process_pages(
 # ═════════════════════════════════════════════════════════════════════════
 
 @router.post("", response_model=schemas.ReceiptOut, status_code=201)
-def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db)):
+def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """
     Save a user-confirmed receipt. `upload_ids` are its pages, in order.
     Called after the user reviews/edits the OCR result.
@@ -224,6 +210,7 @@ def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db)):
         dup = (
             db.query(Receipt.id)
             .filter(
+                Receipt.user_id == user.id,
                 Receipt.vendor_gstin == body.vendor_gstin,
                 Receipt.invoice_number == body.invoice_number,
             )
@@ -236,6 +223,7 @@ def save_receipt(body: schemas.ReceiptCreate, db: Session = Depends(get_db)):
             )
 
     receipt = Receipt(
+        user_id=user.id,
         vendor_name=body.vendor_name,
         vendor_gstin=body.vendor_gstin,
         invoice_number=body.invoice_number,
@@ -287,13 +275,14 @@ def list_receipts(
     q: Optional[str] = Query(None, max_length=100, description="Search vendor name or invoice number"),
     sort: str = Query("-created_at", description="One of: created_at, receipt_date, total, vendor_name (prefix - for descending)"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """List receipts with pagination, filters, search and whitelisted sorting."""
     key = sort.lstrip("-")
     if key not in _SORTABLE:
         raise HTTPException(status_code=422, detail=f"Cannot sort by '{key}'. Allowed: {', '.join(_SORTABLE)}")
 
-    query = db.query(Receipt)
+    query = db.query(Receipt).filter(Receipt.user_id == user.id)
     if category:
         query = query.filter(Receipt.category == category)
     if document_type:
@@ -330,15 +319,15 @@ def list_receipts(
 
 
 @router.get("/{receipt_id}", response_model=schemas.ReceiptOut)
-def get_receipt(receipt_id: UUID, db: Session = Depends(get_db)):
+def get_receipt(receipt_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Get a single receipt by ID."""
-    return _receipt_to_out(_get_or_404(db, receipt_id))
+    return _receipt_to_out(_get_or_404(db, receipt_id, user))
 
 
 @router.patch("/{receipt_id}", response_model=schemas.ReceiptOut)
-def update_receipt(receipt_id: UUID, body: schemas.ReceiptUpdate, db: Session = Depends(get_db)):
+def update_receipt(receipt_id: UUID, body: schemas.ReceiptUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Partial update. If `items` is sent, it replaces all existing items."""
-    receipt = _get_or_404(db, receipt_id)
+    receipt = _get_or_404(db, receipt_id, user)
 
     update_data = body.model_dump(exclude_unset=True)
     items_data = update_data.pop("items", None)
@@ -375,9 +364,9 @@ def update_receipt(receipt_id: UUID, body: schemas.ReceiptUpdate, db: Session = 
 
 
 @router.delete("/{receipt_id}", status_code=204)
-def delete_receipt(receipt_id: UUID, db: Session = Depends(get_db)):
+def delete_receipt(receipt_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Delete a receipt, its items, and all its page images."""
-    receipt = _get_or_404(db, receipt_id)
+    receipt = _get_or_404(db, receipt_id, user)
 
     names = {receipt.image_path, receipt.thumbnail_path}
     for page in receipt.pages:
@@ -394,9 +383,9 @@ def delete_receipt(receipt_id: UUID, db: Session = Depends(get_db)):
 # ═════════════════════════════════════════════════════════════════════════
 
 @router.get("/{receipt_id}/image")
-def get_receipt_image(receipt_id: UUID, db: Session = Depends(get_db)):
+def get_receipt_image(receipt_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user_allow_query)):
     """Serve the receipt image (JPEG, max 1600 px)."""
-    receipt = _get_or_404(db, receipt_id)
+    receipt = _get_or_404(db, receipt_id, user)
     if not receipt.image_path:
         raise HTTPException(status_code=404, detail="Image not found")
     path = _stored_file(receipt.image_path)
@@ -406,9 +395,9 @@ def get_receipt_image(receipt_id: UUID, db: Session = Depends(get_db)):
 
 
 @router.get("/{receipt_id}/thumbnail")
-def get_receipt_thumbnail(receipt_id: UUID, db: Session = Depends(get_db)):
+def get_receipt_thumbnail(receipt_id: UUID, db: Session = Depends(get_db), user: User = Depends(get_current_user_allow_query)):
     """Serve the receipt thumbnail."""
-    receipt = _get_or_404(db, receipt_id)
+    receipt = _get_or_404(db, receipt_id, user)
     if not receipt.thumbnail_path:
         raise HTTPException(status_code=404, detail="Thumbnail not found")
     path = _stored_file(receipt.thumbnail_path)
@@ -418,9 +407,9 @@ def get_receipt_thumbnail(receipt_id: UUID, db: Session = Depends(get_db)):
 
 
 @router.get("/{receipt_id}/pages/{page_number}/image")
-def get_page_image(receipt_id: UUID, page_number: int, db: Session = Depends(get_db)):
+def get_page_image(receipt_id: UUID, page_number: int, db: Session = Depends(get_db), user: User = Depends(get_current_user_allow_query)):
     """Serve one page's image (1-based page_number)."""
-    page = _get_page_or_404(db, receipt_id, page_number)
+    page = _get_page_or_404(db, receipt_id, page_number, user)
     path = _stored_file(page.image_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Image file missing from disk")
@@ -428,9 +417,9 @@ def get_page_image(receipt_id: UUID, page_number: int, db: Session = Depends(get
 
 
 @router.get("/{receipt_id}/pages/{page_number}/thumbnail")
-def get_page_thumbnail(receipt_id: UUID, page_number: int, db: Session = Depends(get_db)):
+def get_page_thumbnail(receipt_id: UUID, page_number: int, db: Session = Depends(get_db), user: User = Depends(get_current_user_allow_query)):
     """Serve one page's thumbnail (1-based page_number)."""
-    page = _get_page_or_404(db, receipt_id, page_number)
+    page = _get_page_or_404(db, receipt_id, page_number, user)
     if not page.thumbnail_path:
         raise HTTPException(status_code=404, detail="Thumbnail not found")
     path = _stored_file(page.thumbnail_path)
@@ -460,11 +449,11 @@ async def _extract_page(upload_id: UUID, page_label: str = "") -> dict:
         raise HTTPException(status_code=502, detail=f"OCR failed{page_label}. Please try again in a moment.")
 
 
-async def _flag_duplicate(db: Session, resp: schemas.ProcessResponse, extracted: dict) -> schemas.ProcessResponse:
+async def _flag_duplicate(db: Session, resp: schemas.ProcessResponse, extracted: dict, user_id: UUID) -> schemas.ProcessResponse:
     """Attach a possible-duplicate warning. Never changes the status: the user decides."""
     if resp.status == REJECTED:
         return resp
-    hit = await run_in_threadpool(find_possible_duplicate, db, extracted)
+    hit = await run_in_threadpool(find_possible_duplicate, db, extracted, user_id)
     if hit:
         resp.possible_duplicate_of, resp.duplicate_warning = str(hit[0]), hit[1]
     return resp
@@ -512,10 +501,15 @@ def _to_process_response(upload_ids: list, extracted: dict, verdict) -> schemas.
     )
 
 
-def _get_page_or_404(db: Session, receipt_id: UUID, page_number: int) -> ReceiptPage:
+def _get_page_or_404(db: Session, receipt_id: UUID, page_number: int, user: User) -> ReceiptPage:
     page = (
         db.query(ReceiptPage)
-        .filter(ReceiptPage.receipt_id == receipt_id, ReceiptPage.page_number == page_number)
+        .join(Receipt, Receipt.id == ReceiptPage.receipt_id)
+        .filter(
+            ReceiptPage.receipt_id == receipt_id,
+            ReceiptPage.page_number == page_number,
+            Receipt.user_id == user.id,
+        )
         .first()
     )
     if not page:
@@ -532,8 +526,8 @@ def _stored_file(name: str) -> Path:
     return path
 
 
-def _get_or_404(db: Session, receipt_id: UUID) -> Receipt:
-    receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()
+def _get_or_404(db: Session, receipt_id: UUID, user: User) -> Receipt:
+    receipt = db.query(Receipt).filter(Receipt.id == receipt_id, Receipt.user_id == user.id).first()
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
     return receipt

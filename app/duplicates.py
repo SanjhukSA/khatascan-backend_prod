@@ -27,13 +27,18 @@ def file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def find_receipt_by_hash(db: Session, digest: str) -> Optional[UUID]:
-    """The saved receipt that already holds an identical page image, if any."""
-    row = db.query(ReceiptPage.receipt_id).filter(ReceiptPage.content_hash == digest).first()
+def find_receipt_by_hash(db: Session, digest: str, user_id: UUID) -> Optional[UUID]:
+    """This user's saved receipt that already holds an identical page image, if any."""
+    row = (
+        db.query(ReceiptPage.receipt_id)
+        .join(Receipt, Receipt.id == ReceiptPage.receipt_id)
+        .filter(ReceiptPage.content_hash == digest, Receipt.user_id == user_id)
+        .first()
+    )
     return row.receipt_id if row else None
 
 
-def find_possible_duplicate(db: Session, extracted: dict) -> Optional[Tuple[UUID, str]]:
+def find_possible_duplicate(db: Session, extracted: dict, user_id: UUID) -> Optional[Tuple[UUID, str]]:
     """
     Look for an already-saved receipt that this extraction probably duplicates.
     Returns (receipt_id, human-readable warning) or None.
@@ -41,7 +46,7 @@ def find_possible_duplicate(db: Session, extracted: dict) -> Optional[Tuple[UUID
     gstin, invoice = extracted.get("vendor_gstin"), extracted.get("invoice_number")
     if gstin and invoice:
         row = db.query(Receipt.id).filter(
-            Receipt.vendor_gstin == gstin, Receipt.invoice_number == invoice
+            Receipt.user_id == user_id, Receipt.vendor_gstin == gstin, Receipt.invoice_number == invoice
         ).first()
         if row:
             return row.id, "This invoice (same seller GSTIN and invoice number) is already saved."
@@ -62,6 +67,7 @@ def find_possible_duplicate(db: Session, extracted: dict) -> Optional[Tuple[UUID
     row = (
         db.query(Receipt.id)
         .filter(
+            Receipt.user_id == user_id,
             Receipt.receipt_date == day,
             Receipt.currency == extracted.get("currency", "INR"),
             Receipt.total.between(total - _PAISA, total + _PAISA),

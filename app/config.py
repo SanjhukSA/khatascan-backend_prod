@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -11,14 +12,24 @@ class Settings(BaseSettings):
     # ── CORS ─────────────────────────────────────────────────────────
     allowed_origins: str = "*"
 
-    # ── Access key ───────────────────────────────────────────────────
-    # Until real auth exists: if set, every /receipts and /analytics call needs this key
-    # (X-API-Key header, or ?api_key= so <img src> works). Empty = no check (local dev).
-    api_key: str = ""
+    # ── Auth ─────────────────────────────────────────────────────────
+    # Required: a long random string, e.g. python -c "import secrets; print(secrets.token_urlsafe(48))"
+    jwt_secret_key: str
+    access_token_expire_minutes: int = 60 * 24 * 7   # 7 days
+    bcrypt_rounds: int = 12   # password hashing cost; tests lower it for speed
+    # Set to false once your accounts exist, so strangers can't sign up.
+    allow_registration: bool = True
+
+    @field_validator("jwt_secret_key")
+    @classmethod
+    def _strong_secret(cls, v: str) -> str:
+        if len(v) < 32:
+            raise ValueError("JWT_SECRET_KEY must be at least 32 characters")
+        return v
 
     # ── Gemini (OCR) ─────────────────────────────────────────────────
     gemini_api_key: str
-    gemini_model: str = "gemini-3.5-flash-lite"
+    gemini_model: str = "gemini-3.6-flash"
 
     # ── PostgreSQL ───────────────────────────────────────────────────
     database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/receipts"

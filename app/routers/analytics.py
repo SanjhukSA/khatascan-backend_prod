@@ -16,8 +16,8 @@ from sqlalchemy.orm import Session
 from app import schemas
 from app.config import settings
 from app.database import engine
-from app.dependencies import get_db
-from app.models import Receipt
+from app.dependencies import get_current_user, get_db
+from app.models import Receipt, User
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -34,11 +34,12 @@ def _today() -> date:
     return datetime.now(ZoneInfo(settings.app_timezone)).date()
 
 
-def _in_month(month: int, year: int, currency: str):
+def _in_month(month: int, year: int, currency: str, user_id):
     return (
         extract("month", effective_date) == month,
         extract("year", effective_date) == year,
         Receipt.currency == currency,
+        Receipt.user_id == user_id,
     )
 
 
@@ -48,6 +49,7 @@ def monthly_summary(
     year: int = Query(None, ge=2020, le=2100),
     currency: str = Query("INR", min_length=3, max_length=3, description="Only receipts in this currency are summed."),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Spending summary for a month (defaults to the current month) in one currency,
@@ -59,21 +61,21 @@ def monthly_summary(
     currency = currency.upper()
 
     total_spent = (
-        db.query(func.coalesce(func.sum(Receipt.total), 0.0)).filter(*_in_month(month, year, currency)).scalar()
+        db.query(func.coalesce(func.sum(Receipt.total), 0.0)).filter(*_in_month(month, year, currency, user.id)).scalar()
     )
-    receipt_count = db.query(func.count(Receipt.id)).filter(*_in_month(month, year, currency)).scalar()
+    receipt_count = db.query(func.count(Receipt.id)).filter(*_in_month(month, year, currency, user.id)).scalar()
     avg_per_receipt = round(total_spent / receipt_count, 2) if receipt_count else 0.0
 
     prev_month, prev_year = (12, year - 1) if month == 1 else (month - 1, year)
     previous_month_total = (
         db.query(func.coalesce(func.sum(Receipt.total), 0.0))
-        .filter(*_in_month(prev_month, prev_year, currency))
+        .filter(*_in_month(prev_month, prev_year, currency, user.id))
         .scalar()
     )
 
     daily_rows = (
         db.query(effective_date.label("day"), func.sum(Receipt.total).label("total"))
-        .filter(*_in_month(month, year, currency))
+        .filter(*_in_month(month, year, currency, user.id))
         .group_by(effective_date)
         .order_by(effective_date)
         .all()
@@ -109,6 +111,7 @@ def category_breakdown(
     year: int = Query(None, ge=2020, le=2100),
     currency: str = Query("INR", min_length=3, max_length=3),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Spending by category for a month in one currency: total, share of spend, receipt count."""
     today = _today()
@@ -122,7 +125,7 @@ def category_breakdown(
             func.sum(Receipt.total).label("total"),
             func.count(Receipt.id).label("count"),
         )
-        .filter(*_in_month(month, year, currency))
+        .filter(*_in_month(month, year, currency, user.id))
         .group_by(Receipt.category)
         .order_by(func.sum(Receipt.total).desc())
         .all()
