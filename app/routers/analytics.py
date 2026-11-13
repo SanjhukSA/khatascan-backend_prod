@@ -23,11 +23,9 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 # The date a receipt counts toward: printed date if we have one, else upload date
 # in the app's timezone (a 01:30 IST upload on the 1st must not land in last month).
-if engine.dialect.name == "postgresql":
-    _upload_day = func.date(func.timezone(settings.app_timezone, Receipt.created_at))
-else:
-    _upload_day = func.date(Receipt.created_at)
-effective_date = func.coalesce(Receipt.receipt_date, _upload_day)
+# Only receipts with a confirmed transaction date
+# are included in monthly analytics.
+effective_date = Receipt.receipt_date
 
 
 def _today() -> date:
