@@ -190,7 +190,7 @@ class ProcessResponse(BaseModel):
     total: float = 0.0
     tax_total: float = 0.0
     discount_total: float = 0.0
-    currency: str = "INR"
+    currency: str = "UNK"
     category: str = "Other"
     confidence: str = "medium"
     total_auto_corrected: bool = False
