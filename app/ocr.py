@@ -95,6 +95,13 @@ Rules:
   If there are no tax columns, total_price = quantity x unit_price - discount.
 - Use null for text you cannot read; never invent values.
 - Reply with ONLY valid JSON: no markdown fences, no explanation.
+- Currency must be identified from the receipt itself.
+  * ₹, Rs., Rupees or an explicit INR label means INR.
+  * USD, EUR, GBP and other explicit currency codes must be preserved.
+  * Do not assume INR based only on the application's location.
+  * If a currency symbol is ambiguous, return null unless the
+    receipt provides enough context to identify the currency.
+  * Never invent a currency.
 """
 
 
