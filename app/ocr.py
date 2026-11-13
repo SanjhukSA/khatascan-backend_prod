@@ -51,7 +51,7 @@ Return ONLY one JSON object with these keys:
   "total": 0.00,
   "tax_total": 0.00,
   "discount_total": 0.00,
-  "currency": "INR",
+  "currency": "ISO 4217 currency code, or null if uncertain",
   "category": "one of: Groceries, Food & Dining, Transport, Shopping, Bills & Utilities, Health, Entertainment, Education, Other",
   "page_number": null,
   "page_count": null,
