@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app import schemas
 from app.config import settings
-from app.database import engine
+
 from app.dependencies import get_current_user, get_db
 from app.models import Receipt, User
 
