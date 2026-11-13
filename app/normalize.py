@@ -199,16 +199,26 @@ _CURRENCY_SYMBOLS = {"₹": "INR", "$": "USD", "€": "EUR", "£": "GBP", "¥": 
 
 
 def normalize_currency(value: Optional[str]) -> str:
-    """ISO-4217-looking code, mapping symbols and 'Rs.' / 'Rupees'. Unknown → INR."""
+    """Normalize currency. Unknown currencies must never silently become INR."""
     s = str(value or "").strip()
+
     if not s:
-        return "INR"
+        return "UNK"
+
     if s in _CURRENCY_SYMBOLS:
         return _CURRENCY_SYMBOLS[s]
-    if s.lower().rstrip(".") in ("rs", "rupee", "rupees", "inr"):
+
+    key = s.lower().rstrip(".")
+
+    if key in ("rs", "rupee", "rupees", "inr", "indian rupee"):
         return "INR"
+
     u = s.upper()
-    return u if re.fullmatch(r"[A-Z]{3}", u) else "INR"
+
+    if re.fullmatch(r"[A-Z]{3}", u):
+        return u
+
+    return "UNK"
 
 
 def normalize_gstin(value: Optional[str]) -> Optional[str]:
