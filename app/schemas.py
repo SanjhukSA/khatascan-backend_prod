@@ -220,7 +220,7 @@ class ReceiptCreate(_ReceiptFieldCleaning):
     total: float = Field(0.0, ge=0)
     tax_total: float = Field(0.0, ge=0)
     discount_total: float = Field(0.0, ge=0)
-    currency: str = "INR"
+    currency: str = "UNK"
     category: str = "Other"
     confidence: str = "medium"
     needs_review: bool = False
