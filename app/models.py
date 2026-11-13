@@ -79,7 +79,7 @@ class Receipt(Base):
     total = Column(Float, nullable=False, default=0.0)
     tax_total = Column(Float, nullable=False, default=0.0)
     discount_total = Column(Float, nullable=False, default=0.0)
-    currency = Column(String(3), nullable=False, default="INR")
+    currency = Column(String(3), nullable=False, default="UNK")
 
     # ── Classification / review state ────────────────────────────────
     category = Column(String(100), nullable=False, default="Other")
